@@ -52,6 +52,7 @@ enum StockpileConfigValues {
     STOCKPILE_CONFIG_MELT = 1,
     STOCKPILE_CONFIG_TRADE = 2,
     STOCKPILE_CONFIG_DUMP = 3,
+    STOCKPILE_CONFIG_FORBID = 6,
     STOCKPILE_CONFIG_TRAIN = 4,
     STOCKPILE_CONFIG_MELT_MASTERWORKS = 5,
 };
@@ -71,6 +72,7 @@ static PersistentDataItem& ensure_stockpile_config(color_ostream& out, int stock
     c.set_bool(STOCKPILE_CONFIG_MELT, false);
     c.set_bool(STOCKPILE_CONFIG_TRADE, false);
     c.set_bool(STOCKPILE_CONFIG_DUMP, false);
+    c.set_int(STOCKPILE_CONFIG_FORBID, 0);
     c.set_bool(STOCKPILE_CONFIG_TRAIN, false);
     c.set_bool(STOCKPILE_CONFIG_MELT_MASTERWORKS, false);
     return c;
@@ -88,7 +90,7 @@ static const int32_t CYCLE_TICKS = 601;
 static int32_t cycle_timestamp = 0; // world->frame_counter at last cycle
 
 static command_result do_command(color_ostream &out, vector<string> &parameters);
-static void do_cycle(color_ostream& out, int32_t& melt_count, int32_t& trade_count, int32_t& dump_count, int32_t& train_count);
+static void do_cycle(color_ostream& out, int32_t& melt_count, int32_t& trade_count, int32_t& dump_count, int32_t& forbid_count, int32_t& unforbid_count, int32_t& train_count);
 
 DFhackCExport command_result plugin_init(color_ostream &out, vector<PluginCommand> &commands) {
     DEBUG(control, out).print("initializing %s\n", plugin_name);
@@ -114,19 +116,31 @@ static df::building_stockpilest* find_stockpile(int32_t stockpile_number) {
 
 static void validate_stockpile_configs(color_ostream& out,
         unordered_map<df::building_stockpilest *, PersistentDataItem> &cache) {
-    vector<int> to_remove;
+    DEBUG(control, out).print("entering validate_stockpile_configs\n");
+    vector<int> to_remove;    
     for (auto& entry : watched_stockpiles) {
         int stockpile_number = entry.first;
+        TRACE(control, out).print("validating config of stockpile #%d\n", stockpile_number);
         PersistentDataItem &c = entry.second;
+        
         auto bld = find_stockpile(stockpile_number);
+        TRACE(control, out).print("find_stockpile(%d): %s", stockpile_number, (!bld ? "true" : "false"));
+        TRACE(control, out).print("get_bool(STOCKPILE_CONFIG_MELT): %s\n", (!c.get_bool(STOCKPILE_CONFIG_MELT) ? "true" : "false"));
+        TRACE(control, out).print("get_bool(STOCKPILE_CONFIG_TRADE): %s\n", (!c.get_bool(STOCKPILE_CONFIG_TRADE) ? "true" : "false"));
+        TRACE(control, out).print("get_bool(STOCKPILE_CONFIG_DUMP): %s\n", (!c.get_bool(STOCKPILE_CONFIG_DUMP) ? "true" : "false"));
+        TRACE(control, out).print("get_bool(STOCKPILE_CONFIG_FORBID): %s\n", (!(c.get_int(STOCKPILE_CONFIG_FORBID)>0) ? "true" : "false"));
+        TRACE(control, out).print("get_bool(STOCKPILE_CONFIG_TRAIN): %s\n", (!c.get_bool(STOCKPILE_CONFIG_TRAIN) ? "true" : "false"));
         if (!bld || (
                 !c.get_bool(STOCKPILE_CONFIG_MELT) &&
                 !c.get_bool(STOCKPILE_CONFIG_TRADE) &&
                 !c.get_bool(STOCKPILE_CONFIG_DUMP) &&
+                !(c.get_int(STOCKPILE_CONFIG_FORBID) > 0) &&
                 !c.get_bool(STOCKPILE_CONFIG_TRAIN))) {
+            TRACE(control, out).print("marking stockpile #%d for removal from list of watched stockpiles\n\n", stockpile_number);
             to_remove.push_back(stockpile_number);
             continue;
         }
+        TRACE(control, out).print("stockpile #%d validated - placing in the cache for next operation\n\n", stockpile_number);
         cache.emplace(bld, c);
     }
     for (int stockpile_number : to_remove)
@@ -181,14 +195,18 @@ DFhackCExport command_result plugin_onupdate(color_ostream &out) {
     if (!is_enabled || !Core::getInstance().isMapLoaded() || !World::IsSiteLoaded())
         return CR_OK;
     if (world->frame_counter - cycle_timestamp >= CYCLE_TICKS) {
-        int32_t melt_count = 0, trade_count = 0, dump_count = 0, train_count = 0;
-        do_cycle(out, melt_count, trade_count, dump_count, train_count);
+        int32_t melt_count = 0, trade_count = 0, dump_count = 0, forbid_count = 0, unforbid_count = 0, train_count = 0;
+        do_cycle(out, melt_count, trade_count, dump_count, forbid_count, unforbid_count, train_count);
         if (0 < melt_count)
             out.print("logistics: marked %d item(s) for melting\n", melt_count);
         if (0 < trade_count)
             out.print("logistics: marked %d item(s) for trading\n", trade_count);
         if (0 < dump_count)
             out.print("logistics: marked %d item(s) for dumping\n", dump_count);
+        if (0 < forbid_count)
+            out.print("logistics: marked %d item(s) forbidden\n", forbid_count);
+        if (0 < unforbid_count)
+            out.print("logistics: unforbid %d items(s)\n", unforbid_count);
         if (0 < train_count)
             out.print("logistics: marked %d animal(s) for training\n", train_count);
     }
@@ -346,6 +364,44 @@ public:
      }
 };
 
+class ForbidStockProcessor : public StockProcessor {
+public:
+    ForbidStockProcessor(int32_t stockpile_number, bool enabled, ProcessorStats& stats)
+        : StockProcessor("forbid", stockpile_number, enabled, stats) { }
+
+    bool is_designated(color_ostream& out, df::item* item) override {
+        return item->flags.bits.forbid;
+    }
+
+    bool can_designate(color_ostream& out, df::item* item) override {
+        return true;
+    }
+
+    bool designate(color_ostream& out, df::item* item) override {
+        item->flags.bits.forbid = true;
+        return true;
+    }
+};
+
+class UnforbidStockProcessor : public StockProcessor {
+public:
+    UnforbidStockProcessor(int32_t stockpile_number, bool enabled, ProcessorStats& stats)
+        : StockProcessor("unforbid", stockpile_number, enabled, stats) { }
+
+    bool is_designated(color_ostream& out, df::item* item) override {
+        return !(item->flags.bits.forbid);
+    }
+
+    bool can_designate(color_ostream& out, df::item* item) override {
+        return true;
+    }
+
+    bool designate(color_ostream& out, df::item* item) override {
+        item->flags.bits.forbid = false;
+        return true;
+    }
+};
+
 class TrainStockProcessor : public StockProcessor {
 public:
     TrainStockProcessor(int32_t stockpile_number, bool enabled, ProcessorStats& stats)
@@ -391,7 +447,7 @@ private:
     uint32_t get_bad_flags() {
         df::item_flags flags;
         #define F(x) flags.bits.x = true;
-        F(forbid); F(garbage_collect); F(hostile); F(on_fire);
+        F(garbage_collect); F(hostile); F(on_fire);
         F(rotten); F(trader); F(in_building); F(construction);
         F(artifact); F(spider_web); F(owned); F(in_job);
         #undef F
@@ -447,11 +503,15 @@ static void scan_stockpile(color_ostream &out, df::building_stockpilest *bld,
         MeltStockProcessor &melt_stock_processor,
         TradeStockProcessor &trade_stock_processor,
         DumpStockProcessor &dump_stock_processor,
-        TrainStockProcessor &train_stock_processor) {
+        ForbidStockProcessor &forbid_stockprocessor,
+        UnforbidStockProcessor &unforbid_stockprocessor,
+        TrainStockProcessor& train_stock_processor) {
     auto id = bld->id;
     Buildings::StockpileIterator items;
     for (items.begin(bld); !items.done(); ++items) {
+        
         df::item *item = *items;
+        TRACE(cycle,out).print("scan_stockpile: %d  scan item: %d\n", id, item->id);
         if (item->flags.whole & bad_flags.whole) {
             TRACE(cycle,out).print("rejected flag check\n");
             continue;
@@ -466,11 +526,15 @@ static void scan_stockpile(color_ostream &out, df::building_stockpilest *bld,
             for (df::item *contained_item : contents) {
                 scan_item(out, contained_item, melt_stock_processor);
                 scan_item(out, contained_item, dump_stock_processor);
+                scan_item(out, contained_item, forbid_stockprocessor);
+                scan_item(out, contained_item, unforbid_stockprocessor);
             }
             continue;
         }
         scan_item(out, item, melt_stock_processor);
         scan_item(out, item, dump_stock_processor);
+        scan_item(out, item, forbid_stockprocessor);
+        scan_item(out, item, unforbid_stockprocessor);
         scan_item(out, item, train_stock_processor);
     }
 }
@@ -494,11 +558,11 @@ static void train_partials(color_ostream& out, int32_t& train_count) {
     }
 }
 
-static void do_cycle(color_ostream& out, int32_t& melt_count, int32_t& trade_count, int32_t& dump_count, int32_t& train_count) {
+static void do_cycle(color_ostream& out, int32_t& melt_count, int32_t& trade_count, int32_t& dump_count, int32_t& forbid_count, int32_t& unforbid_count, int32_t& train_count) {
     DEBUG(cycle,out).print("running %s cycle\n", plugin_name);
     cycle_timestamp = world->frame_counter;
 
-    ProcessorStats melt_stats, trade_stats, dump_stats, train_stats;
+    ProcessorStats melt_stats, trade_stats, dump_stats, forbid_stats, unforbid_stats, train_stats;
     unordered_map<df::building_stockpilest *, PersistentDataItem> cache;
     validate_stockpile_configs(out, cache);
 
@@ -511,20 +575,28 @@ static void do_cycle(color_ostream& out, int32_t& melt_count, int32_t& trade_cou
         bool melt_masterworks = c.get_bool(STOCKPILE_CONFIG_MELT_MASTERWORKS);
         bool trade = c.get_bool(STOCKPILE_CONFIG_TRADE);
         bool dump = c.get_bool(STOCKPILE_CONFIG_DUMP);
+        bool forbid = 1 == c.get_int(STOCKPILE_CONFIG_FORBID);
+        bool unforbid = 2 == c.get_int(STOCKPILE_CONFIG_FORBID);
         bool train = c.get_bool(STOCKPILE_CONFIG_TRAIN);
 
         MeltStockProcessor melt_stock_processor(stockpile_number, melt, melt_stats, melt_masterworks);
         TradeStockProcessor trade_stock_processor(stockpile_number, trade, trade_stats);
         DumpStockProcessor dump_stock_processor(stockpile_number, dump, dump_stats);
+        ForbidStockProcessor forbid_stock_processor(stockpile_number, forbid, forbid_stats);
+        UnforbidStockProcessor unforbid_stock_processor(stockpile_number, unforbid, unforbid_stats);
         TrainStockProcessor train_stock_processor(stockpile_number, train, train_stats);
 
-        scan_stockpile(out, bld, melt_stock_processor,
-                trade_stock_processor, dump_stock_processor, train_stock_processor);
+        scan_stockpile(out, bld, melt_stock_processor, 
+                trade_stock_processor, dump_stock_processor, 
+                forbid_stock_processor, unforbid_stock_processor, 
+                train_stock_processor);
     }
 
     melt_count = melt_stats.newly_designated;
     trade_count = trade_stats.newly_designated;
     dump_count = dump_stats.newly_designated;
+    forbid_count = forbid_stats.newly_designated;
+    unforbid_count = unforbid_stats.newly_designated;
     train_count = train_stats.newly_designated;
 
     if (config.get_bool(CONFIG_TRAIN_PARTIAL)) {
@@ -547,17 +619,21 @@ static int logistics_getStockpileData(lua_State *L) {
     unordered_map<df::building_stockpilest *, PersistentDataItem> cache;
     validate_stockpile_configs(*out, cache);
 
-    ProcessorStats melt_stats, trade_stats, dump_stats, train_stats;
+    ProcessorStats melt_stats, trade_stats, dump_stats, forbid_stats, unforbid_stats, train_stats;
 
     for (auto bld : df::global::world->buildings.other.STOCKPILE) {
         int32_t stockpile_number = bld->stockpile_number;
         MeltStockProcessor melt_stock_processor(stockpile_number, false, melt_stats, false);
         TradeStockProcessor trade_stock_processor(stockpile_number, false, trade_stats);
         DumpStockProcessor dump_stock_processor(stockpile_number, false, dump_stats);
+        ForbidStockProcessor forbid_stock_processor(stockpile_number, false, forbid_stats);
+        UnforbidStockProcessor unforbid_stock_processor(stockpile_number, false, unforbid_stats);
         TrainStockProcessor train_stock_processor(stockpile_number, false, train_stats);
 
         scan_stockpile(*out, bld, melt_stock_processor,
-                trade_stock_processor, dump_stock_processor, train_stock_processor);
+                trade_stock_processor, dump_stock_processor, 
+                forbid_stock_processor, unforbid_stock_processor, 
+                train_stock_processor);
     }
 
     unordered_map<string, StatMap> stats;
@@ -567,6 +643,10 @@ static int logistics_getStockpileData(lua_State *L) {
     stats.emplace("trade_can_designate", trade_stats.can_designate_counts);
     stats.emplace("dump_designated", dump_stats.designated_counts);
     stats.emplace("dump_can_designate", dump_stats.can_designate_counts);
+    stats.emplace("forbid_designated", forbid_stats.designated_counts);
+    stats.emplace("forbid_can_designate", forbid_stats.can_designate_counts);
+    stats.emplace("unforbid_designated", unforbid_stats.designated_counts);
+    stats.emplace("unforbid_can_designate", unforbid_stats.can_designate_counts);
     stats.emplace("train_designated", train_stats.designated_counts);
     stats.emplace("train_can_designate", train_stats.can_designate_counts);
     Lua::Push(L, stats);
@@ -580,6 +660,8 @@ static int logistics_getStockpileData(lua_State *L) {
         bool melt_masterworks = c.get_bool(STOCKPILE_CONFIG_MELT_MASTERWORKS);
         bool trade = c.get_bool(STOCKPILE_CONFIG_TRADE);
         bool dump = c.get_bool(STOCKPILE_CONFIG_DUMP);
+        bool forbid = 1 == c.get_int(STOCKPILE_CONFIG_FORBID);
+        bool unforbid = 2 == c.get_int(STOCKPILE_CONFIG_FORBID);
         bool train = c.get_bool(STOCKPILE_CONFIG_TRAIN);
 
         unordered_map<string, string> sconfig;
@@ -587,6 +669,8 @@ static int logistics_getStockpileData(lua_State *L) {
         sconfig.emplace("melt_masterworks", melt_masterworks ? "true" : "false");
         sconfig.emplace("trade", trade ? "true" : "false");
         sconfig.emplace("dump", dump ? "true" : "false");
+        sconfig.emplace("forbid", forbid ? "true" : "false");
+        sconfig.emplace("unforbid", unforbid ? "true" : "false");
         sconfig.emplace("train", train ? "true" : "false");
 
         configs.emplace(bld->stockpile_number, sconfig);
@@ -600,12 +684,14 @@ static int logistics_getStockpileData(lua_State *L) {
 
 static void logistics_cycle(color_ostream &out) {
     DEBUG(control, out).print("entering logistics_cycle\n");
-    int32_t melt_count = 0, trade_count = 0, dump_count = 0, train_count = 0;
-    do_cycle(out, melt_count, trade_count, dump_count, train_count);
+    int32_t melt_count = 0, trade_count = 0, dump_count = 0, forbid_count = 0, unforbid_count = 0, train_count = 0;
+    do_cycle(out, melt_count, trade_count, dump_count, forbid_count, unforbid_count, train_count);
     out.print("logistics: marked %d item(s) for melting\n", melt_count);
     out.print("logistics: marked %d item(s) for trading\n", trade_count);
     out.print("logistics: marked %d item(s) for dumping\n", dump_count);
-    out.print("logistics: marked %d animal(s) for train\n", train_count);
+    out.print("logistics: marked %d item(s) forbidden\n", forbid_count);
+    out.print("logistics: unforbid %d items(s)\n", unforbid_count);
+    out.print("logistics: marked %d animal(s) for training\n", train_count);
 }
 
 static void find_stockpiles(lua_State *L, int idx,
@@ -634,12 +720,14 @@ static unordered_map<string, int> get_stockpile_config(int32_t stockpile_number)
         stockpile_config.emplace("melt_masterworks", c.get_bool(STOCKPILE_CONFIG_MELT_MASTERWORKS));
         stockpile_config.emplace("trade", c.get_bool(STOCKPILE_CONFIG_TRADE));
         stockpile_config.emplace("dump", c.get_bool(STOCKPILE_CONFIG_DUMP));
+        stockpile_config.emplace("forbid", c.get_int(STOCKPILE_CONFIG_FORBID));
         stockpile_config.emplace("train", c.get_bool(STOCKPILE_CONFIG_TRAIN));
     } else {
         stockpile_config.emplace("melt", false);
         stockpile_config.emplace("melt_masterworks", false);
         stockpile_config.emplace("trade", false);
         stockpile_config.emplace("dump", false);
+        stockpile_config.emplace("forbid", 0);
         stockpile_config.emplace("train", false);
     }
     return stockpile_config;
@@ -666,9 +754,9 @@ static int logistics_getStockpileConfigs(lua_State *L) {
     return 1;
 }
 
-static void logistics_setStockpileConfig(color_ostream& out, int stockpile_number, bool melt, bool trade, bool dump, bool train, bool melt_masterworks) {
-    DEBUG(control, out).print("entering logistics_setStockpileConfig stockpile_number=%d, melt=%d, trade=%d, dump=%d, train=%d, melt_masterworks=%d\n",
-        stockpile_number, melt, trade, dump, train, melt_masterworks);
+static void logistics_setStockpileConfig(color_ostream& out, int stockpile_number, bool melt, bool trade, bool dump, int forbid, bool train, bool melt_masterworks) {
+    DEBUG(control, out).print("entering logistics_setStockpileConfig\n stockpile_number=%d, melt=%d, trade=%d, dump=%d, forbid=%d, train=%d, melt_masterworks=%d\n",
+        stockpile_number, melt, trade, dump, forbid, train, melt_masterworks);
 
     if (!find_stockpile(stockpile_number)) {
         out.printerr("invalid stockpile number: %d\n", stockpile_number);
@@ -680,6 +768,7 @@ static void logistics_setStockpileConfig(color_ostream& out, int stockpile_numbe
     c.set_bool(STOCKPILE_CONFIG_MELT_MASTERWORKS, melt_masterworks);
     c.set_bool(STOCKPILE_CONFIG_TRADE, trade);
     c.set_bool(STOCKPILE_CONFIG_DUMP, dump);
+    c.set_int(STOCKPILE_CONFIG_FORBID, forbid);
     c.set_bool(STOCKPILE_CONFIG_TRAIN, train);
 }
 
@@ -722,9 +811,15 @@ static int logistics_getGlobalCounts(lua_State *L) {
     }
 
     size_t num_dump = 0;
+    size_t num_forbid = 0;
+    size_t num_unforbid = 0;
     for (auto item : world->items.other.IN_PLAY) {
         if (item->flags.bits.dump)
             ++num_dump;
+        if (item->flags.bits.forbid)
+            ++num_forbid;
+        else
+            ++num_unforbid;
     }
 
     size_t num_train = 0;
@@ -734,6 +829,8 @@ static int logistics_getGlobalCounts(lua_State *L) {
     results.emplace("total_melt", num_melt);
     results.emplace("total_trade", num_trade);
     results.emplace("total_dump", num_dump);
+    results.emplace("total_forbid", num_forbid);
+    results.emplace("total_unforbid", num_unforbid);
     results.emplace("total_train", num_train);
     Lua::Push(L, results);
 
