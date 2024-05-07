@@ -439,30 +439,26 @@ private:
 } bad_flags;
 
 static void scan_item(color_ostream &out, df::item *item, StockProcessor &processor) {
-    DEBUG(cycle,out).print("scan_item [%s] item_id=%d\n", processor.name.c_str(), item->id);
-
-    if (DBG_NAME(cycle).isEnabled(DebugCategory::LTRACE)) {
-        string name = "";
-        item->getItemDescription(&name, 0);
-        TRACE(cycle,out).print("item: %s\n", name.c_str());
-    }
+    TRACE(cycle,out).print("[%c] ", processor.name[0]);
 
     if (processor.is_designated(out, item)) {
-        TRACE(cycle,out).print("already designated\n");
+        TRACE(cycle,out).print("is_designated ");
         ++processor.stats.designated_counts[processor.stockpile_number];
         return;
     }
 
     if (!processor.can_designate(out, item)) {
-        TRACE(cycle,out).print("cannot designate\n");
+        TRACE(cycle,out).print("undesignatable ");
         return;
     }
 
     if (!processor.enabled) {
+        TRACE(cycle,out).print("disabled ");
         ++processor.stats.can_designate_counts[processor.stockpile_number];
         return;
     }
 
+    TRACE(cycle,out).print("designating ");
     processor.designate(out, item);
     ++processor.stats.newly_designated;
     ++processor.stats.designated_counts[processor.stockpile_number];
@@ -489,34 +485,47 @@ static void scan_stockpile(color_ostream &out, df::building_stockpilest *bld,
         TrainStockProcessor &train_stock_processor,
         ForbidStockProcessor &forbid_stock_processor,
         UnforbidStockProcessor &unforbid_stock_processor) {
-    auto id = bld->id;
+    TRACE(cycle,out).print("scan_stockpile [%s (%d)]\n",bld->name.c_str(),bld->stockpile_number);
+    auto sp_id = bld->id;
     Buildings::StockpileIterator items;
     for (items.begin(bld); !items.done(); ++items) {
         df::item *item = *items;
+        string item_name = "";
+        item->getItemDescription(&item_name, 0);
+        TRACE(cycle,out).print("  item[%s] - ", item_name.c_str());
+        TRACE(cycle,out).flush();
         if (item->flags.whole & bad_flags.whole) {
             TRACE(cycle,out).print("rejected flag check\n");
             continue;
         }
-        if (!item->isAssignedToThisStockpile(id) && non_accepted_storage_item(bld, item))
+        if (!item->isAssignedToThisStockpile(sp_id) && non_accepted_storage_item(bld, item)) {
+            TRACE(cycle,out).print("rejected non-assigned/accepted storage item (%d)(%d)\n",item->isAssignedToThisStockpile(sp_id),non_accepted_storage_item(bld, item));
             continue;
+        }
         scan_item(out, item, trade_stock_processor);
-        if (item->isAssignedToThisStockpile(id)) {
-            TRACE(cycle,out).print("assignedToStockpile\n");
+        if (item->isAssignedToThisStockpile(sp_id)) {
+            TRACE(cycle,out).print("assignedToStockpile ");
             vector<df::item *> contents;
             Items::getContainedItems(item, &contents);
             for (df::item *contained_item : contents) {
+                string contained_item_name = "";
+                contained_item->getItemDescription(&contained_item_name, 0);
+                TRACE(cycle,out).print("\n  - contained_item[%s] ", contained_item_name.c_str());
                 scan_item(out, contained_item, forbid_stock_processor);
                 scan_item(out, contained_item, unforbid_stock_processor);
                 scan_item(out, contained_item, melt_stock_processor);
                 scan_item(out, contained_item, dump_stock_processor);
             }
+            TRACE(cycle,out).print("[end]\n");
             continue;
         }
+        TRACE(cycle,out).print("!assignedToStockpile ");
         scan_item(out, item, forbid_stock_processor);
         scan_item(out, item, unforbid_stock_processor);
         scan_item(out, item, melt_stock_processor);
         scan_item(out, item, dump_stock_processor);
         scan_item(out, item, train_stock_processor);
+        TRACE(cycle,out).print("[end]\n");
     }
 }
 
